@@ -17,7 +17,7 @@ BIN_CHANNEL_RAW = os.getenv("BIN_CHANNEL", "-1004442649308").strip()
 try:
     BIN_CHANNEL = int(BIN_CHANNEL_RAW)
 except ValueError:
-    BIN_CHANNEL = -1004442649308
+    BIN_CHANNEL = -1004416159243
 
 REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "yagamicorporation").replace("@", "").strip()
 
