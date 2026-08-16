@@ -19,13 +19,7 @@ try:
 except ValueError:
     BIN_CHANNEL = -1004442649308
 
-REQUIRED_CHANNEL_ID_RAW = os.getenv("REQUIRED_CHANNEL_ID", "-1003985304953").strip()
-try:
-    REQUIRED_CHANNEL_ID = int(REQUIRED_CHANNEL_ID_RAW) if REQUIRED_CHANNEL_ID_RAW else 0
-except ValueError:
-    REQUIRED_CHANNEL_ID = 0
-
-REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "yagamicorporation").replace("@", "")
+REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "yagamicorporation").replace("@", "").strip()
 
 # -------------------------------------------------------------------
 # Server Settings
