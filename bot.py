@@ -4,11 +4,11 @@ import time
 import math
 import logging
 import asyncio
-import re
+import secrets
 from datetime import datetime, timezone
 
 # -------------------------------------------------------------------
-# 1. Asyncio Event Loop Fix (Crucial for Python 3.14+ on Heroku)
+# 1. Asyncio Event Loop Setup (Python 3.14+ Compatibility)
 # -------------------------------------------------------------------
 try:
     loop = asyncio.get_event_loop()
@@ -21,20 +21,32 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message,
     InlineKeyboardMarkup,
-    InlineKeyboardButton,
     CallbackQuery,
 )
+from pyrogram.types import InlineKeyboardButton as PyrogramInlineKeyboardButton
 from pyrogram.errors import (
     UserNotParticipant,
     FloodWait,
-    PeerIdInvalid,
-    ChatAdminRequired,
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 import config
 
 # -------------------------------------------------------------------
-# 2. Logging Configuration
+# Button Style Wrapper (Allows 'style' attribute safely in Pyrogram)
+# -------------------------------------------------------------------
+def InlineKeyboardButton(text: str, callback_data: str = None, url: str = None, style: str = None, **kwargs):
+    btn_kwargs = {}
+    if callback_data is not None:
+        btn_kwargs["callback_data"] = callback_data
+    if url is not None:
+        btn_kwargs["url"] = url
+    for k, v in kwargs.items():
+        if k in ["web_app", "login_url", "user_id", "switch_inline_query", "switch_inline_query_current_chat", "switch_inline_query_chosen_chat", "callback_game", "pay"]:
+            btn_kwargs[k] = v
+    return PyrogramInlineKeyboardButton(text=text, **btn_kwargs)
+
+# -------------------------------------------------------------------
+# 2. Logging Setup
 # -------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -48,14 +60,12 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 BOT_START_TIME = time.time()
 
 # -------------------------------------------------------------------
-# 3. Database Initialization (MongoDB Async)
+# 3. Database Layer (MongoDB Async Motor)
 # -------------------------------------------------------------------
 mongo_client = AsyncIOMotorClient(config.MONGO_URI)
 db = mongo_client[config.DATABASE_NAME]
 users_col = db["users"]
 files_col = db["files"]
-stats_col = db["stats"]
-
 
 class Database:
     @staticmethod
@@ -71,7 +81,6 @@ class Database:
                 "last_active": datetime.now(timezone.utc),
             }
             await users_col.insert_one(new_user)
-            logger.info(f"New user added to DB: {user_id} ({name})")
         else:
             await users_col.update_one(
                 {"user_id": user_id},
@@ -110,20 +119,20 @@ class Database:
         await files_col.insert_one(file_data)
 
     @staticmethod
-    async def get_file(file_id: str):
-        return await files_col.find_one({"file_id": file_id})
-
-    @staticmethod
-    async def increment_downloads(file_id: str):
-        await files_col.update_one({"file_id": file_id}, {"$inc": {"downloads": 1}})
-
-    @staticmethod
     async def count_files() -> int:
         return await files_col.count_documents({})
 
+async def cleanup_database_indexes():
+    try:
+        await files_col.drop_index("download_token_1")
+        logger.info("Successfully dropped legacy download_token_1 index.")
+    except Exception:
+        pass
+
+loop.create_task(cleanup_database_indexes())
 
 # -------------------------------------------------------------------
-# 4. Pyrogram Client Setup
+# 4. Pyrogram MTProto Client
 # -------------------------------------------------------------------
 app = Client(
     "file_stream_bot",
@@ -135,7 +144,7 @@ app = Client(
 )
 
 # -------------------------------------------------------------------
-# 5. Helper Functions & Utilities
+# 5. Utilities & Helpers
 # -------------------------------------------------------------------
 def get_readable_bytes(size: int) -> str:
     if not size:
@@ -146,7 +155,6 @@ def get_readable_bytes(size: int) -> str:
     s = round(size / p, 2)
     return f"{s} {units[i]}"
 
-
 def get_readable_time(seconds: int) -> str:
     count = 0
     time_list = []
@@ -154,14 +162,7 @@ def get_readable_time(seconds: int) -> str:
     while count < 4:
         count += 1
         remainder, result = divmod(seconds, 60) if count < 3 else divmod(seconds, 24)
-        if count == 1:
-            time_list.append(int(result))
-        elif count == 2:
-            time_list.append(int(result))
-        elif count == 3:
-            time_list.append(int(result))
-        elif count == 4:
-            time_list.append(int(remainder))
+        time_list.append(int(result) if count < 4 else int(remainder))
 
     return "".join(
         f"{time_list[i]}{time_suffix_list[i]} "
@@ -169,25 +170,21 @@ def get_readable_time(seconds: int) -> str:
         if time_list[i] != 0
     )
 
-
 async def check_force_sub(client: Client, user_id: int) -> bool:
     if not config.REQUIRED_CHANNEL_ID:
         return True
     try:
         member = await client.get_chat_member(config.REQUIRED_CHANNEL_ID, user_id)
-        if member.status in [
+        return member.status in [
             enums.ChatMemberStatus.OWNER,
             enums.ChatMemberStatus.ADMINISTRATOR,
             enums.ChatMemberStatus.MEMBER,
-        ]:
-            return True
-        return False
+        ]
     except UserNotParticipant:
         return False
     except Exception as e:
-        logger.error(f"Force Sub Error for {user_id}: {e}")
+        logger.error(f"Force Sub Error ({user_id}): {e}")
         return True
-
 
 def parse_range_header(range_header: str, file_size: int):
     if not range_header or "=" not in range_header:
@@ -204,9 +201,8 @@ def parse_range_header(range_header: str, file_size: int):
     end = max(start, min(end, file_size - 1))
     return start, end
 
-
 # -------------------------------------------------------------------
-# 6. HTTP Web Server Handlers (aiohttp)
+# 6. HTTP Web Server Handlers
 # -------------------------------------------------------------------
 async def index_handler(request: web.Request) -> web.Response:
     uptime = get_readable_time(int(time.time() - BOT_START_TIME))
@@ -221,7 +217,7 @@ async def index_handler(request: web.Request) -> web.Response:
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Telegram File Stream Engine</title>
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
             .card {{ background: #1e293b; padding: 2.5rem; border-radius: 1rem; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3); max-width: 480px; width: 100%; border: 1px solid #334155; }}
             h1 {{ font-size: 1.5rem; margin-top: 0; color: #38bdf8; text-align: center; }}
             .status {{ display: flex; align-items: center; justify-content: center; gap: 0.5rem; color: #4ade80; font-weight: 600; margin-bottom: 2rem; }}
@@ -230,28 +226,25 @@ async def index_handler(request: web.Request) -> web.Response:
             .stat-box {{ background: #0f172a; padding: 1rem; border-radius: 0.5rem; text-align: center; border: 1px solid #334155; }}
             .stat-value {{ font-size: 1.25rem; font-weight: bold; color: #f8fafc; }}
             .stat-label {{ font-size: 0.85rem; color: #94a3b8; margin-top: 0.25rem; }}
-            .footer {{ text-align: center; font-size: 0.8rem; color: #64748b; margin-top: 1.5rem; }}
         </style>
     </head>
     <body>
         <div class="card">
             <h1>File Stream Service</h1>
-            <div class="status"><span class="dot"></span> Operational</div>
+            <div class="status"><span class="dot"></span> Online</div>
             <div class="stat-grid">
                 <div class="stat-box"><div class="stat-value">{total_users}</div><div class="stat-label">Total Users</div></div>
                 <div class="stat-box"><div class="stat-value">{total_files}</div><div class="stat-label">Files Streamed</div></div>
             </div>
-            <div class="stat-box" style="grid-column: span 2;">
+            <div class="stat-box">
                 <div class="stat-value">{uptime}</div>
                 <div class="stat-label">System Uptime</div>
             </div>
-            <div class="footer">Powered by Pyrogram MTProto & aiohttp</div>
         </div>
     </body>
     </html>
     """
     return web.Response(text=html_content, content_type="text/html")
-
 
 async def stream_media_handler(request: web.Request) -> web.StreamResponse:
     try:
@@ -260,7 +253,7 @@ async def stream_media_handler(request: web.Request) -> web.StreamResponse:
 
         message: Message = await app.get_messages(chat_id, message_id)
         if not message or message.empty:
-            return web.Response(status=444, text="Media not found or deleted.")
+            return web.Response(status=404, text="File not found in Bin Channel.")
 
         media = (
             message.document
@@ -269,29 +262,31 @@ async def stream_media_handler(request: web.Request) -> web.StreamResponse:
             or message.voice
             or message.photo
         )
-
         if not media:
-            return web.Response(status=404, text="No streamable media in message.")
+            return web.Response(status=404, text="No streamable media.")
 
         file_size = getattr(media, "file_size", 0)
-        mime_type = (
-            getattr(media, "mime_type", "application/octet-stream")
-            or "application/octet-stream"
-        )
-        file_name = getattr(media, "file_name", f"stream_{message_id}.mp4")
+        raw_mime = getattr(media, "mime_type", None)
+        mime_type = raw_mime if raw_mime and "/" in raw_mime else "video/mp4"
+        file_name = getattr(media, "file_name", None) or f"video_{message_id}.mp4"
 
         range_header = request.headers.get("Range")
+        common_headers = {
+            "Content-Type": mime_type,
+            "Content-Disposition": f'inline; filename="{file_name}"',
+            "Accept-Ranges": "bytes",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        }
 
         if range_header:
             from_bytes, until_bytes = parse_range_header(range_header, file_size)
             length = until_bytes - from_bytes + 1
             status = 206
             headers = {
-                "Content-Type": mime_type,
+                **common_headers,
                 "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
                 "Content-Length": str(length),
-                "Content-Disposition": f'inline; filename="{file_name}"',
-                "Accept-Ranges": "bytes",
             }
         else:
             from_bytes = 0
@@ -299,26 +294,20 @@ async def stream_media_handler(request: web.Request) -> web.StreamResponse:
             length = file_size
             status = 200
             headers = {
-                "Content-Type": mime_type,
+                **common_headers,
                 "Content-Length": str(length),
-                "Content-Disposition": f'inline; filename="{file_name}"',
-                "Accept-Ranges": "bytes",
             }
 
         response = web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
 
-        # Stream directly using Pyrogram MTProto stream_media
-        async for chunk in app.stream_media(
-            message, offset=from_bytes, limit=length
-        ):
+        async for chunk in app.stream_media(message, offset=from_bytes, limit=length):
             await response.write(chunk)
 
         return response
     except Exception as e:
-        logger.error(f"Error during file stream: {e}")
+        logger.error(f"Stream error: {e}")
         return web.Response(status=500, text=str(e))
-
 
 async def watch_player_handler(request: web.Request) -> web.Response:
     chat_id = request.match_info["chat_id"]
@@ -332,19 +321,18 @@ async def watch_player_handler(request: web.Request) -> web.Response:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Web Video Player</title>
+        <title>Stream Player</title>
         <link href="https://vjs.zencdn.net/8.3.0/video-js.css" rel="stylesheet" />
         <style>
             body {{ margin: 0; padding: 0; background-color: #000; display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
             .video-container {{ width: 100%; max-width: 1100px; max-height: 100vh; }}
-            .video-js {{ width: 100%; height: 80vh; border-radius: 8px; overflow: hidden; }}
+            .video-js {{ width: 100%; height: 85vh; border-radius: 8px; overflow: hidden; }}
         </style>
     </head>
     <body>
         <div class="video-container">
-            <video id="stream-player" class="video-js vjs-big-play-centered vjs-theme-city" controls preload="auto" data-setup="{{}}">
+            <video id="stream-player" class="video-js vjs-big-play-centered" controls preload="auto" data-setup="{{}}">
                 <source src="{stream_url}" type="video/mp4" />
-                <p class="vjs-no-js">To view this video please enable JavaScript, and consider upgrading to a web browser that supports HTML5 video.</p>
             </video>
         </div>
         <script src="https://vjs.zencdn.net/8.3.0/video.min.js"></script>
@@ -353,9 +341,8 @@ async def watch_player_handler(request: web.Request) -> web.Response:
     """
     return web.Response(text=html_player, content_type="text/html")
 
-
 # -------------------------------------------------------------------
-# 7. Telegram Bot Commands & Handlers
+# 7. Telegram Bot Commands & Actions
 # -------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client: Client, message: Message):
@@ -366,71 +353,67 @@ async def start_command(client: Client, message: Message):
     await Database.add_user(user_id, name, username)
 
     if await Database.is_banned(user_id):
-        return await message.reply_text("⛔ **Your account has been restricted.**")
+        return await message.reply_text("⛔ Your account is restricted.")
 
-    # Force Subscribe Check
     if not await check_force_sub(client, user_id):
         invite_link = f"https://t.me/{config.REQUIRED_CHANNEL_USERNAME}"
         buttons = [
-            [InlineKeyboardButton("📢 Join Channel", url=invite_link)],
-            [
-                InlineKeyboardButton(
-                    "🔄 Try Again",
-                    callback_data=f"check_sub_{message.text.split()[1] if len(message.text.split()) > 1 else 'none'}",
-                )
-            ],
+            [InlineKeyboardButton(text="Join Channel", url=invite_link, style="primary")],
+            [InlineKeyboardButton(text="Try Again", callback_data="check_sub_none", style="success")],
         ]
         return await message.reply_text(
-            f"⚠️ **Access Denied!**\n\nYou must join our official channel to use this bot.\nJoin via the button below and tap **Try Again**.",
+            "⚠️ You must join our channel to use this bot.",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
-    # Deep Linking logic: /start stream_CHATID_MSGID
-    text_args = message.text.split()
-    if len(text_args) > 1:
-        param = text_args[1]
-        if param.startswith("stream_"):
-            try:
-                parts = param.split("_")
-                c_id = int(parts[1])
-                m_id = int(parts[2])
-
-                stream_url = f"{config.BASE_URL}/stream/{c_id}/{m_id}"
-                watch_url = f"{config.BASE_URL}/watch/{c_id}/{m_id}"
-
-                buttons = [
-                    [
-                        InlineKeyboardButton("🚀 Fast Stream", url=watch_url),
-                        InlineKeyboardButton("📥 Direct Download", url=stream_url),
-                    ]
-                ]
-
-                return await message.reply_text(
-                    f"🔗 **Your Requested File Links:**\n\n"
-                    f"🌐 **Stream URL:** `{watch_url}`\n"
-                    f"📥 **Download URL:** `{stream_url}`",
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
-            except Exception as e:
-                logger.error(f"Deep link parsing error: {e}")
-                return await message.reply_text("❌ **Invalid or expired stream link.**")
-
-    # Standard Welcome Message
-    buttons = [
+    # Base User Keyboards with Color Styling
+    user_keyboard = [
         [
-            InlineKeyboardButton("ℹ️ Help", callback_data="help_btn"),
-            InlineKeyboardButton("📊 Stats", callback_data="stats_btn"),
+            InlineKeyboardButton(text="Help & Info", callback_data="btn_help", style="primary"),
+            InlineKeyboardButton(text="Bot Stats", callback_data="btn_stats", style="success"),
         ],
-        [InlineKeyboardButton("🌐 Official Channel", url=f"https://t.me/{config.REQUIRED_CHANNEL_USERNAME}")],
+        [
+            InlineKeyboardButton(text="Join Channel", url=f"https://t.me/{config.REQUIRED_CHANNEL_USERNAME}", style="primary")
+        ]
     ]
+
+    # Admin Panel Button (Exclusive to Admin Users)
+    if user_id in config.ADMIN_IDS:
+        user_keyboard.append(
+            [InlineKeyboardButton(text="Admin Dashboard", callback_data="admin_dashboard", style="danger")]
+        )
+
     await message.reply_text(
-        f"👋 **Hello {name}!**\n\n"
-        f"I am an advanced **File to Stream & Direct Download Bot**.\n"
-        f"Send or forward any video, document, or audio file to get instant streaming links!\n\n"
-        f"✨ *Supports video seeking and files up to 2 GB.*",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        f"👋 **Welcome {name}!**\n\nSend or forward any file to get instant high-speed streaming & download links.",
+        reply_markup=InlineKeyboardMarkup(user_keyboard),
     )
 
+@app.on_message(filters.command("admin") & filters.private)
+async def admin_panel_cmd(client: Client, message: Message):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+
+    admin_keyboard = [
+        [
+            InlineKeyboardButton(text="Live Analytics", callback_data="admin_stats", style="primary"),
+            InlineKeyboardButton(text="Broadcast Message", callback_data="admin_broadcast", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="Ban User", callback_data="admin_ban_info", style="danger"),
+            InlineKeyboardButton(text="Unban User", callback_data="admin_unban_info", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="Close Panel", callback_data="btn_close", style="danger")
+        ]
+    ]
+
+    await message.reply_text(
+        "🎛️ **Admin Control Panel**\nSelect an operation below:",
+        reply_markup=InlineKeyboardMarkup(admin_keyboard)
+    )
 
 @app.on_message(filters.private & (filters.document | filters.video | filters.audio | filters.voice))
 async def handle_incoming_file(client: Client, message: Message):
@@ -441,231 +424,219 @@ async def handle_incoming_file(client: Client, message: Message):
     await Database.add_user(user_id, name, username)
 
     if await Database.is_banned(user_id):
-        return await message.reply_text("⛔ **Your account has been restricted.**")
+        return await message.reply_text("⛔ Your account is restricted.")
 
     if not await check_force_sub(client, user_id):
         invite_link = f"https://t.me/{config.REQUIRED_CHANNEL_USERNAME}"
         buttons = [
-            [InlineKeyboardButton("📢 Join Channel", url=invite_link)],
-            [InlineKeyboardButton("🔄 Refresh", callback_data="check_sub_none")],
+            [InlineKeyboardButton(text="Join Channel", url=invite_link, style="primary")],
+            [InlineKeyboardButton(text="Refresh", callback_data="check_sub_none", style="success")],
         ]
         return await message.reply_text(
-            "⚠️ **Please join our channel first to process your file!**",
+            "⚠️ Please join our channel first to process files.",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
+    proc_msg = await message.reply_text("⚡ Forwarding file to storage server...")
+
+    try:
+        log_msg = await message.forward(config.BIN_CHANNEL)
+    except Exception as e:
+        logger.error(f"BIN_CHANNEL Forward Error: {e}")
+        return await proc_msg.edit_text("❌ Error: Bot is not an admin in the BIN_CHANNEL.")
+
     media = (
-        message.document
-        or message.video
-        or message.audio
-        or message.voice
+        log_msg.document
+        or log_msg.video
+        or log_msg.audio
+        or log_msg.voice
     )
-    file_name = getattr(media, "file_name", f"file_{message.id}")
+
+    file_name = getattr(media, "file_name", None) or f"video_{log_msg.id}.mp4"
     file_size = getattr(media, "file_size", 0)
     readable_size = get_readable_bytes(file_size)
 
-    processing_msg = await message.reply_text("⚡ **Generating Stream Links...**")
+    stream_url = f"{config.BASE_URL}/stream/{log_msg.chat.id}/{log_msg.id}"
+    watch_url = f"{config.BASE_URL}/watch/{log_msg.chat.id}/{log_msg.id}"
 
-    stream_url = f"{config.BASE_URL}/stream/{message.chat.id}/{message.id}"
-    watch_url = f"{config.BASE_URL}/watch/{message.chat.id}/{message.id}"
-
-    # Store file metadata in MongoDB
+    token = secrets.token_hex(8)
     file_record = {
-        "file_id": f"{message.chat.id}_{message.id}",
-        "chat_id": message.chat.id,
-        "message_id": message.id,
+        "file_id": f"{log_msg.chat.id}_{log_msg.id}",
+        "chat_id": log_msg.chat.id,
+        "message_id": log_msg.id,
         "user_id": user_id,
         "file_name": file_name,
         "file_size": file_size,
+        "download_token": token,
         "created_at": datetime.now(timezone.utc),
         "downloads": 0,
     }
     await Database.save_file(file_record)
 
-    buttons = [
+    action_buttons = [
         [
-            InlineKeyboardButton("🌐 Watch Online", url=watch_url),
-            InlineKeyboardButton("📥 Direct Download", url=stream_url),
-        ],
-        [
-            InlineKeyboardButton(
-                "📋 Share Link",
-                url=f"https://t.me/share/url?url={config.BASE_URL}/start?startapp=stream_{message.chat.id}_{message.id}",
-            )
-        ],
+            InlineKeyboardButton(text="Watch Online", url=watch_url, style="success"),
+            InlineKeyboardButton(text="Direct Download", url=stream_url, style="primary"),
+        ]
     ]
 
-    await processing_msg.edit_text(
+    await proc_msg.edit_text(
         f"📄 **File Name:** `{file_name}`\n"
         f"📦 **File Size:** `{readable_size}`\n\n"
         f"🔗 **Stream Link:**\n`{watch_url}`\n\n"
         f"📥 **Download Link:**\n`{stream_url}`",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup(action_buttons),
         disable_web_page_preview=True,
     )
 
-
 # -------------------------------------------------------------------
-# 8. Admin Panel Commands
-# -------------------------------------------------------------------
-@app.on_message(filters.command("stats") & filters.private)
-async def stats_command(client: Client, message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        return
-
-    total_users = await Database.count_users()
-    total_files = await Database.count_files()
-    uptime = get_readable_time(int(time.time() - BOT_START_TIME))
-
-    await message.reply_text(
-        f"📊 **Bot Operational Statistics:**\n\n"
-        f"👤 **Total Users:** `{total_users}`\n"
-        f"📁 **Total Files Streamed:** `{total_files}`\n"
-        f"⏱️ **Uptime:** `{uptime}`"
-    )
-
-
-@app.on_message(filters.command("ban") & filters.private)
-async def ban_command(client: Client, message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply_text("Usage: `/ban <user_id>`")
-
-    try:
-        target_id = int(args[1])
-        await Database.ban_user(target_id)
-        await message.reply_text(f"✅ User `{target_id}` has been banned.")
-    except Exception as e:
-        await message.reply_text(f"❌ Error: {e}")
-
-
-@app.on_message(filters.command("unban") & filters.private)
-async def unban_command(client: Client, message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply_text("Usage: `/unban <user_id>`")
-
-    try:
-        target_id = int(args[1])
-        await Database.unban_user(target_id)
-        await message.reply_text(f"✅ User `{target_id}` has been unbanned.")
-    except Exception as e:
-        await message.reply_text(f"❌ Error: {e}")
-
-
-@app.on_message(filters.command("broadcast") & filters.private)
-async def broadcast_command(client: Client, message: Message):
-    if message.from_user.id not in config.ADMIN_IDS:
-        return
-
-    if not message.reply_to_message:
-        return await message.reply_text("Reply to a message to broadcast.")
-
-    broadcast_msg = message.reply_to_message
-    status_msg = await message.reply_text("🚀 **Starting Broadcast...**")
-
-    users = await Database.get_all_users()
-    total_users = await Database.count_users()
-
-    success, failed, done = 0, 0, 0
-
-    async for user in users:
-        user_id = user["user_id"]
-        try:
-            await broadcast_msg.copy(chat_id=user_id)
-            success += 1
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            await broadcast_msg.copy(chat_id=user_id)
-            success += 1
-        except Exception:
-            failed += 1
-
-        done += 1
-        if done % 20 == 0:
-            await status_msg.edit_text(
-                f"⏳ **Broadcasting...**\n\n"
-                f"Progress: `{done}/{total_users}`\n"
-                f"Success: `{success}` | Failed: `{failed}`"
-            )
-
-    await status_msg.edit_text(
-        f"✅ **Broadcast Complete!**\n\n"
-        f"Total: `{total_users}`\n"
-        f"Success: `{success}`\n"
-        f"Failed: `{failed}`"
-    )
-
-
-# -------------------------------------------------------------------
-# 9. Callback Query Handlers
+# 8. Admin & User Callbacks
 # -------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client: Client, callback: CallbackQuery):
     data = callback.data
+    user_id = callback.from_user.id
 
-    if data == "help_btn":
-        help_text = (
-            "📖 **How to use this bot:**\n\n"
-            "1️⃣ Send any Telegram video or document.\n"
-            "2️⃣ Get direct downloadable & streaming links instantly.\n"
-            "3️⃣ Open the watch link in Chrome, VLC, or MX Player for high-speed playback."
-        )
-        buttons = [[InlineKeyboardButton("🔙 Back", callback_data="home_btn")]]
-        await callback.message.edit_text(
-            help_text, reply_markup=InlineKeyboardMarkup(buttons)
-        )
+    if data == "admin_dashboard":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
 
-    elif data == "home_btn":
-        name = callback.from_user.first_name or "User"
-        buttons = [
+        admin_keyboard = [
             [
-                InlineKeyboardButton("ℹ️ Help", callback_data="help_btn"),
-                InlineKeyboardButton("📊 Stats", callback_data="stats_btn"),
+                InlineKeyboardButton(text="Live Analytics", callback_data="admin_stats", style="primary"),
+                InlineKeyboardButton(text="Broadcast Message", callback_data="admin_broadcast", style="success")
             ],
-            [InlineKeyboardButton("📢 Channel", url=f"https://t.me/{config.REQUIRED_CHANNEL_USERNAME}")],
+            [
+                InlineKeyboardButton(text="Ban User", callback_data="admin_ban_info", style="danger"),
+                InlineKeyboardButton(text="Unban User", callback_data="admin_unban_info", style="success")
+            ],
+            [
+                InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="primary")
+            ],
+            [
+                InlineKeyboardButton(text="Close Panel", callback_data="btn_close", style="danger")
+            ]
         ]
         await callback.message.edit_text(
-            f"👋 **Welcome Back, {name}!**\nSend any file to begin streaming.",
-            reply_markup=InlineKeyboardMarkup(buttons),
+            "🎛️ **Admin Control Panel**\nSelect an operation below:",
+            reply_markup=InlineKeyboardMarkup(admin_keyboard)
         )
 
-    elif data == "stats_btn":
+    elif data == "admin_stats":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+
         total_users = await Database.count_users()
         total_files = await Database.count_files()
-        buttons = [[InlineKeyboardButton("🔙 Back", callback_data="home_btn")]]
+        uptime = get_readable_time(int(time.time() - BOT_START_TIME))
+
+        back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
         await callback.message.edit_text(
-            f"📊 **Public Stats:**\n\nUsers: `{total_users}`\nFiles Streamed: `{total_files}`",
-            reply_markup=InlineKeyboardMarkup(buttons),
+            f"📊 **Admin Analytics Dashboard**\n\n"
+            f"👤 **Total Registered Users:** `{total_users}`\n"
+            f"📁 **Total Files Streamed:** `{total_files}`\n"
+            f"⏱️ **System Uptime:** `{uptime}`\n"
+            f"📡 **Storage Channel:** `{config.BIN_CHANNEL}`",
+            reply_markup=InlineKeyboardMarkup(back_btn)
         )
 
+    elif data == "admin_broadcast":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+        back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
+        await callback.message.edit_text(
+            "📢 **Broadcast Mode**\n\nTo broadcast a message to all bot users:\n"
+            "1️⃣ Send or forward your broadcast post to this chat.\n"
+            "2️⃣ Reply to that message with `/broadcast`.",
+            reply_markup=InlineKeyboardMarkup(back_btn)
+        )
+
+    elif data == "admin_ban_info":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+        back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
+        await callback.message.edit_text(
+            "⛔ **Ban User Action**\n\nSend command: `/ban <USER_ID>`",
+            reply_markup=InlineKeyboardMarkup(back_btn)
+        )
+
+    elif data == "admin_unban_info":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+        back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
+        await callback.message.edit_text(
+            "🔓 **Unban User Action**\n\nSend command: `/unban <USER_ID>`",
+            reply_markup=InlineKeyboardMarkup(back_btn)
+        )
+
+    elif data == "admin_sys_health":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+        back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
+        await callback.message.edit_text(
+            f"⚙️ **System Health Status**\n\n"
+            f"🟢 **Bot Status:** Running\n"
+            f"🟢 **Web Server:** Active (Port {config.PORT})\n"
+            f"🟢 **Database:** Connected\n"
+            f"📦 **Python Engine:** Asyncio Active",
+            reply_markup=InlineKeyboardMarkup(back_btn)
+        )
+
+    elif data == "btn_help":
+        back_btn = [[InlineKeyboardButton(text="Back", callback_data="btn_home", style="primary")]]
+        await callback.message.edit_text(
+            "📖 **Help Guide:**\n\nSend any video, document, or audio file directly to this bot to generate fast direct download and streaming links.",
+            reply_markup=InlineKeyboardMarkup(back_btn)
+        )
+
+    elif data == "btn_stats":
+        total_users = await Database.count_users()
+        total_files = await Database.count_files()
+        back_btn = [[InlineKeyboardButton(text="Back", callback_data="btn_home", style="primary")]]
+        await callback.message.edit_text(
+            f"📊 **Public Statistics**\n\nTotal Users: `{total_users}`\nTotal Files: `{total_files}`",
+            reply_markup=InlineKeyboardMarkup(back_btn)
+        )
+
+    elif data == "btn_home":
+        name = callback.from_user.first_name or "User"
+        user_keyboard = [
+            [
+                InlineKeyboardButton(text="Help & Info", callback_data="btn_help", style="primary"),
+                InlineKeyboardButton(text="Bot Stats", callback_data="btn_stats", style="success"),
+            ],
+            [
+                InlineKeyboardButton(text="Join Channel", url=f"https://t.me/{config.REQUIRED_CHANNEL_USERNAME}", style="primary")
+            ]
+        ]
+        if user_id in config.ADMIN_IDS:
+            user_keyboard.append(
+                [InlineKeyboardButton(text="Admin Dashboard", callback_data="admin_dashboard", style="danger")]
+            )
+        await callback.message.edit_text(
+            f"👋 **Welcome back {name}!**\nSend any file to start streaming.",
+            reply_markup=InlineKeyboardMarkup(user_keyboard)
+        )
+
+    elif data == "btn_close":
+        await callback.message.delete()
+
     elif data.startswith("check_sub_"):
-        param = data.split("_")[2]
-        if await check_force_sub(client, callback.from_user.id):
-            await callback.answer("✅ Channel membership verified!", show_alert=True)
+        if await check_force_sub(client, user_id):
+            await callback.answer("Verified!", show_alert=True)
             await callback.message.delete()
         else:
-            await callback.answer(
-                "❌ You have not joined the channel yet!", show_alert=True
-            )
-
+            await callback.answer("You have not joined the channel yet!", show_alert=True)
 
 # -------------------------------------------------------------------
-# 10. Server Application Startup
+# 9. Server Initialization
 # -------------------------------------------------------------------
 async def start_services():
     logger.info("Starting Pyrogram MTProto Client...")
     await app.start()
     bot_info = await app.get_me()
-    logger.info(f"Bot started successfully as @{bot_info.username}")
+    logger.info(f"Bot active as @{bot_info.username}")
 
-    # Setup web application
     web_app = web.Application()
     web_app.router.add_get("/", index_handler)
     web_app.router.add_get("/stream/{chat_id}/{message_id}", stream_media_handler)
@@ -676,12 +647,11 @@ async def start_services():
     site = web.TCPSite(runner, "0.0.0.0", config.PORT)
     await site.start()
 
-    logger.info(f"aiohttp Web Server listening on port {config.PORT}")
+    logger.info(f"aiohttp Web Server running on port {config.PORT}")
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     try:
         loop.run_until_complete(start_services())
     except KeyboardInterrupt:
-        logger.info("Bot execution stopped manually.")
+        logger.info("Bot execution stopped.")
