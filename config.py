@@ -9,6 +9,11 @@ BASE_URL = os.getenv("BASE_URL", "https://filetostream-9257652a6256.herokuapp.co
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
+# Telegram API Configuration
+TELEGRAM_API_URL = os.getenv("TELEGRAM_API_URL", "https://api.telegram.org")
+API_ID = int(os.getenv("API_ID", "35485985"))
+API_HASH = os.getenv("API_HASH", "5441c09a9c8bf58374e1f8f227b95794")
+
 # Database (MongoDB Atlas)
 MONGO_URI = os.getenv(
     "MONGO_URI",
