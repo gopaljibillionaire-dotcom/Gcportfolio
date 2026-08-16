@@ -24,12 +24,12 @@ from pyrogram.types import (
     CallbackQuery,
 )
 from pyrogram.types import InlineKeyboardButton as PyrogramInlineKeyboardButton
-from pyrogram.errors import UserNotParticipant
+from pyrogram.errors import UserNotParticipant, PeerIdInvalid, UsernameNotOccupied
 from motor.motor_asyncio import AsyncIOMotorClient
 import config
 
 # -------------------------------------------------------------------
-# Custom Button Wrapper (Prevents Pyrogram 'style' TypeError)
+# Custom Button Wrapper (Safely passes style without Pyrogram errors)
 # -------------------------------------------------------------------
 def InlineKeyboardButton(text: str, callback_data: str = None, url: str = None, style: str = None, **kwargs):
     btn_kwargs = {}
@@ -129,7 +129,7 @@ app = Client(
 )
 
 # -------------------------------------------------------------------
-# 5. Utilities & Helpers
+# 5. Utilities & Force-Sub Helper
 # -------------------------------------------------------------------
 def get_readable_bytes(size: int) -> str:
     if not size:
@@ -156,10 +156,11 @@ def get_readable_time(seconds: int) -> str:
     )
 
 async def check_force_sub(client: Client, user_id: int) -> bool:
-    if not config.REQUIRED_CHANNEL_ID:
+    if not config.REQUIRED_CHANNEL_USERNAME:
         return True
     try:
-        member = await client.get_chat_member(config.REQUIRED_CHANNEL_ID, user_id)
+        # Resolves via public username to prevent "Peer id invalid"
+        member = await client.get_chat_member(f"@{config.REQUIRED_CHANNEL_USERNAME}", user_id)
         return member.status in [
             enums.ChatMemberStatus.OWNER,
             enums.ChatMemberStatus.ADMINISTRATOR,
@@ -167,6 +168,9 @@ async def check_force_sub(client: Client, user_id: int) -> bool:
         ]
     except UserNotParticipant:
         return False
+    except (PeerIdInvalid, UsernameNotOccupied) as e:
+        logger.error(f"Force Sub Error ({user_id}): Username @{config.REQUIRED_CHANNEL_USERNAME} not recognized - {e}")
+        return True
     except Exception as e:
         logger.error(f"Force Sub Error ({user_id}): {e}")
         return True
@@ -277,14 +281,13 @@ async def stream_media_handler(request: web.Request) -> web.StreamResponse:
         if range_header:
             headers["Content-Range"] = f"bytes {from_bytes}-{until_bytes}/{file_size}"
 
-        # Respond directly to HEAD requests from players probing headers
         if request.method == "HEAD":
             return web.Response(status=status, headers=headers)
 
         response = web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
 
-        # Precise Byte Slicing across Pyrogram Chunks
+        # Precise byte-slicing streaming engine
         current_pos = 0
         async for chunk in app.stream_media(message):
             chunk_len = len(chunk)
@@ -392,10 +395,7 @@ async def admin_panel_cmd(client: Client, message: Message):
     admin_keyboard = [
         [
             InlineKeyboardButton(text="Live Analytics", callback_data="admin_stats", style="primary"),
-            InlineKeyboardButton(text="Broadcast Message", callback_data="admin_broadcast", style="success")
-        ],
-        [
-            InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="primary")
+            InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="success")
         ],
         [
             InlineKeyboardButton(text="Close Panel", callback_data="btn_close", style="danger")
@@ -433,9 +433,12 @@ async def handle_incoming_file(client: Client, message: Message):
 
     try:
         log_msg = await message.forward(config.BIN_CHANNEL)
+    except PeerIdInvalid:
+        logger.error(f"BIN_CHANNEL Error: Peer ID {config.BIN_CHANNEL} invalid. Add @Filetostreamrobot as admin to the channel.")
+        return await proc_msg.edit_text("❌ Error: Bot is not added as Administrator in the BIN_CHANNEL.")
     except Exception as e:
         logger.error(f"BIN_CHANNEL Forward Error: {e}")
-        return await proc_msg.edit_text("❌ Error: Bot is not an admin in the BIN_CHANNEL.")
+        return await proc_msg.edit_text("❌ Error: Could not forward file to BIN_CHANNEL.")
 
     media = (
         log_msg.document
@@ -491,7 +494,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
 
     if data == "admin_dashboard":
         if user_id not in config.ADMIN_IDS:
-            return await callback.answer("Unauthorized", show_alert=True)
+            return await callback.answer("Unauthorized access", show_alert=True)
 
         admin_keyboard = [
             [
@@ -531,7 +534,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
         await callback.message.edit_text(
             f"⚙️ **System Health Status**\n\n"
-            f"🟢 **Bot Status:** Running\n"
+            f"🟢 **Bot Status:** Active\n"
             f"🟢 **Web Server:** Active (Port {config.PORT})\n"
             f"🟢 **Database:** Connected",
             reply_markup=InlineKeyboardMarkup(back_btn)
