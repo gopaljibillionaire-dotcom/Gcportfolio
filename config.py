@@ -5,7 +5,7 @@ load_dotenv()
 
 # Bot Credentials & Server Settings
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8788884009:AAEifV0e9MVaLtUzQD40uVoaO1WtxA1VUFs")
-BASE_URL = os.getenv("BASE_URL", "https://filetostream-9257652a6256.herokuapp.com/").rstrip("/")
+BASE_URL = os.getenv("BASE_URL", "https://filetostream-9257652a6256.herokuapp.com").rstrip("/")
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
