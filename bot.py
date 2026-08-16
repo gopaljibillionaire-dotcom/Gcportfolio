@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timezone
 
 # -------------------------------------------------------------------
-# 1. Asyncio Event Loop Setup (Python 3.14+ Compatibility)
+# 1. Asyncio Event Loop Setup
 # -------------------------------------------------------------------
 try:
     loop = asyncio.get_event_loop()
@@ -24,15 +24,12 @@ from pyrogram.types import (
     CallbackQuery,
 )
 from pyrogram.types import InlineKeyboardButton as PyrogramInlineKeyboardButton
-from pyrogram.errors import (
-    UserNotParticipant,
-    FloodWait,
-)
+from pyrogram.errors import UserNotParticipant
 from motor.motor_asyncio import AsyncIOMotorClient
 import config
 
 # -------------------------------------------------------------------
-# Button Style Wrapper (Allows 'style' attribute safely in Pyrogram)
+# Custom Button Wrapper (Prevents Pyrogram 'style' TypeError)
 # -------------------------------------------------------------------
 def InlineKeyboardButton(text: str, callback_data: str = None, url: str = None, style: str = None, **kwargs):
     btn_kwargs = {}
@@ -97,18 +94,6 @@ class Database:
     async def is_banned(user_id: int) -> bool:
         user = await users_col.find_one({"user_id": user_id})
         return user.get("banned", False) if user else False
-
-    @staticmethod
-    async def ban_user(user_id: int):
-        await users_col.update_one({"user_id": user_id}, {"$set": {"banned": True}})
-
-    @staticmethod
-    async def unban_user(user_id: int):
-        await users_col.update_one({"user_id": user_id}, {"$set": {"banned": False}})
-
-    @staticmethod
-    async def get_all_users():
-        return users_col.find({})
 
     @staticmethod
     async def count_users() -> int:
@@ -202,7 +187,7 @@ def parse_range_header(range_header: str, file_size: int):
     return start, end
 
 # -------------------------------------------------------------------
-# 6. HTTP Web Server Handlers
+# 6. Web Server & Streaming Route Handlers
 # -------------------------------------------------------------------
 async def index_handler(request: web.Request) -> web.Response:
     uptime = get_readable_time(int(time.time() - BOT_START_TIME))
@@ -263,7 +248,7 @@ async def stream_media_handler(request: web.Request) -> web.StreamResponse:
             or message.photo
         )
         if not media:
-            return web.Response(status=404, text="No streamable media.")
+            return web.Response(status=404, text="No streamable media found.")
 
         file_size = getattr(media, "file_size", 0)
         raw_mime = getattr(media, "mime_type", None)
@@ -271,38 +256,48 @@ async def stream_media_handler(request: web.Request) -> web.StreamResponse:
         file_name = getattr(media, "file_name", None) or f"video_{message_id}.mp4"
 
         range_header = request.headers.get("Range")
-        common_headers = {
+        if range_header:
+            from_bytes, until_bytes = parse_range_header(range_header, file_size)
+        else:
+            from_bytes = 0
+            until_bytes = file_size - 1
+
+        length = until_bytes - from_bytes + 1
+        status = 206 if range_header else 200
+
+        headers = {
             "Content-Type": mime_type,
             "Content-Disposition": f'inline; filename="{file_name}"',
             "Accept-Ranges": "bytes",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Content-Length": str(length),
         }
 
         if range_header:
-            from_bytes, until_bytes = parse_range_header(range_header, file_size)
-            length = until_bytes - from_bytes + 1
-            status = 206
-            headers = {
-                **common_headers,
-                "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
-                "Content-Length": str(length),
-            }
-        else:
-            from_bytes = 0
-            until_bytes = file_size - 1
-            length = file_size
-            status = 200
-            headers = {
-                **common_headers,
-                "Content-Length": str(length),
-            }
+            headers["Content-Range"] = f"bytes {from_bytes}-{until_bytes}/{file_size}"
+
+        # Respond directly to HEAD requests from players probing headers
+        if request.method == "HEAD":
+            return web.Response(status=status, headers=headers)
 
         response = web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
 
-        async for chunk in app.stream_media(message, offset=from_bytes, limit=length):
-            await response.write(chunk)
+        # Precise Byte Slicing across Pyrogram Chunks
+        current_pos = 0
+        async for chunk in app.stream_media(message):
+            chunk_len = len(chunk)
+            chunk_end = current_pos + chunk_len - 1
+
+            if current_pos <= until_bytes and chunk_end >= from_bytes:
+                start_in_chunk = max(0, from_bytes - current_pos)
+                end_in_chunk = min(chunk_len, until_bytes - current_pos + 1)
+                await response.write(chunk[start_in_chunk:end_in_chunk])
+
+            current_pos += chunk_len
+            if current_pos > until_bytes:
+                break
 
         return response
     except Exception as e:
@@ -325,14 +320,17 @@ async def watch_player_handler(request: web.Request) -> web.Response:
         <link href="https://vjs.zencdn.net/8.3.0/video-js.css" rel="stylesheet" />
         <style>
             body {{ margin: 0; padding: 0; background-color: #000; display: flex; justify-content: center; align-items: center; min-height: 100vh; }}
-            .video-container {{ width: 100%; max-width: 1100px; max-height: 100vh; }}
+            .video-container {{ width: 100%; max-width: 1100px; padding: 10px; box-sizing: border-box; }}
             .video-js {{ width: 100%; height: 85vh; border-radius: 8px; overflow: hidden; }}
         </style>
     </head>
     <body>
         <div class="video-container">
-            <video id="stream-player" class="video-js vjs-big-play-centered" controls preload="auto" data-setup="{{}}">
+            <video id="stream-player" class="video-js vjs-big-play-centered" controls preload="metadata" data-setup="{{}}">
                 <source src="{stream_url}" type="video/mp4" />
+                <p class="vjs-no-js">
+                    To view this video please enable JavaScript, or consider upgrading to a web browser that supports HTML5 video.
+                </p>
             </video>
         </div>
         <script src="https://vjs.zencdn.net/8.3.0/video.min.js"></script>
@@ -342,7 +340,7 @@ async def watch_player_handler(request: web.Request) -> web.Response:
     return web.Response(text=html_player, content_type="text/html")
 
 # -------------------------------------------------------------------
-# 7. Telegram Bot Commands & Actions
+# 7. Telegram Bot Commands & Handlers
 # -------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client: Client, message: Message):
@@ -366,7 +364,6 @@ async def start_command(client: Client, message: Message):
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
-    # Base User Keyboards with Color Styling
     user_keyboard = [
         [
             InlineKeyboardButton(text="Help & Info", callback_data="btn_help", style="primary"),
@@ -377,7 +374,6 @@ async def start_command(client: Client, message: Message):
         ]
     ]
 
-    # Admin Panel Button (Exclusive to Admin Users)
     if user_id in config.ADMIN_IDS:
         user_keyboard.append(
             [InlineKeyboardButton(text="Admin Dashboard", callback_data="admin_dashboard", style="danger")]
@@ -397,10 +393,6 @@ async def admin_panel_cmd(client: Client, message: Message):
         [
             InlineKeyboardButton(text="Live Analytics", callback_data="admin_stats", style="primary"),
             InlineKeyboardButton(text="Broadcast Message", callback_data="admin_broadcast", style="success")
-        ],
-        [
-            InlineKeyboardButton(text="Ban User", callback_data="admin_ban_info", style="danger"),
-            InlineKeyboardButton(text="Unban User", callback_data="admin_unban_info", style="success")
         ],
         [
             InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="primary")
@@ -490,7 +482,7 @@ async def handle_incoming_file(client: Client, message: Message):
     )
 
 # -------------------------------------------------------------------
-# 8. Admin & User Callbacks
+# 8. Callbacks
 # -------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client: Client, callback: CallbackQuery):
@@ -504,14 +496,7 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         admin_keyboard = [
             [
                 InlineKeyboardButton(text="Live Analytics", callback_data="admin_stats", style="primary"),
-                InlineKeyboardButton(text="Broadcast Message", callback_data="admin_broadcast", style="success")
-            ],
-            [
-                InlineKeyboardButton(text="Ban User", callback_data="admin_ban_info", style="danger"),
-                InlineKeyboardButton(text="Unban User", callback_data="admin_unban_info", style="success")
-            ],
-            [
-                InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="primary")
+                InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="success")
             ],
             [
                 InlineKeyboardButton(text="Close Panel", callback_data="btn_close", style="danger")
@@ -533,39 +518,10 @@ async def callback_handler(client: Client, callback: CallbackQuery):
         back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
         await callback.message.edit_text(
             f"📊 **Admin Analytics Dashboard**\n\n"
-            f"👤 **Total Registered Users:** `{total_users}`\n"
+            f"👤 **Total Users:** `{total_users}`\n"
             f"📁 **Total Files Streamed:** `{total_files}`\n"
             f"⏱️ **System Uptime:** `{uptime}`\n"
             f"📡 **Storage Channel:** `{config.BIN_CHANNEL}`",
-            reply_markup=InlineKeyboardMarkup(back_btn)
-        )
-
-    elif data == "admin_broadcast":
-        if user_id not in config.ADMIN_IDS:
-            return await callback.answer("Unauthorized", show_alert=True)
-        back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
-        await callback.message.edit_text(
-            "📢 **Broadcast Mode**\n\nTo broadcast a message to all bot users:\n"
-            "1️⃣ Send or forward your broadcast post to this chat.\n"
-            "2️⃣ Reply to that message with `/broadcast`.",
-            reply_markup=InlineKeyboardMarkup(back_btn)
-        )
-
-    elif data == "admin_ban_info":
-        if user_id not in config.ADMIN_IDS:
-            return await callback.answer("Unauthorized", show_alert=True)
-        back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
-        await callback.message.edit_text(
-            "⛔ **Ban User Action**\n\nSend command: `/ban <USER_ID>`",
-            reply_markup=InlineKeyboardMarkup(back_btn)
-        )
-
-    elif data == "admin_unban_info":
-        if user_id not in config.ADMIN_IDS:
-            return await callback.answer("Unauthorized", show_alert=True)
-        back_btn = [[InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]]
-        await callback.message.edit_text(
-            "🔓 **Unban User Action**\n\nSend command: `/unban <USER_ID>`",
             reply_markup=InlineKeyboardMarkup(back_btn)
         )
 
@@ -577,15 +533,14 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             f"⚙️ **System Health Status**\n\n"
             f"🟢 **Bot Status:** Running\n"
             f"🟢 **Web Server:** Active (Port {config.PORT})\n"
-            f"🟢 **Database:** Connected\n"
-            f"📦 **Python Engine:** Asyncio Active",
+            f"🟢 **Database:** Connected",
             reply_markup=InlineKeyboardMarkup(back_btn)
         )
 
     elif data == "btn_help":
         back_btn = [[InlineKeyboardButton(text="Back", callback_data="btn_home", style="primary")]]
         await callback.message.edit_text(
-            "📖 **Help Guide:**\n\nSend any video, document, or audio file directly to this bot to generate fast direct download and streaming links.",
+            "📖 **Help Guide:**\n\nSend any video or file directly to this bot to generate fast direct download and streaming links.",
             reply_markup=InlineKeyboardMarkup(back_btn)
         )
 
@@ -629,17 +584,17 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             await callback.answer("You have not joined the channel yet!", show_alert=True)
 
 # -------------------------------------------------------------------
-# 9. Server Initialization
+# 9. Server Startup
 # -------------------------------------------------------------------
 async def start_services():
-    logger.info("Starting Pyrogram MTProto Client...")
+    logger.info("Starting Pyrogram Client...")
     await app.start()
     bot_info = await app.get_me()
     logger.info(f"Bot active as @{bot_info.username}")
 
     web_app = web.Application()
     web_app.router.add_get("/", index_handler)
-    web_app.router.add_get("/stream/{chat_id}/{message_id}", stream_media_handler)
+    web_app.router.add_route("*", "/stream/{chat_id}/{message_id}", stream_media_handler)
     web_app.router.add_get("/watch/{chat_id}/{message_id}", watch_player_handler)
 
     runner = web.AppRunner(web_app)
@@ -647,7 +602,7 @@ async def start_services():
     site = web.TCPSite(runner, "0.0.0.0", config.PORT)
     await site.start()
 
-    logger.info(f"aiohttp Web Server running on port {config.PORT}")
+    logger.info(f"Web server running on port {config.PORT}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
