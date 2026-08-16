@@ -10,7 +10,7 @@ load_dotenv()
 # -------------------------------------------------------------------
 API_ID = int(os.getenv("API_ID", "35485985"))
 API_HASH = os.getenv("API_HASH", "5441c09a9c8bf58374e1f8f227b95794")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8788884009:AAEifV0e9MVaLtUzQD40uVoaO1WtxA1VUFs)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8788884009:AAEifV0e9MVaLtUzQD40uVoaO1WtxA1VUFs")
 
 # Telegram HTTP API endpoint (Defaults to official API server)
 TELEGRAM_API_URL = os.getenv("TELEGRAM_API_URL", "https://api.telegram.org")
