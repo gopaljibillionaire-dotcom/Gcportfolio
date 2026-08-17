@@ -13,7 +13,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8788884009:AAEifV0e9MVaLtUzQD40uVoaO1WtxA1VU
 # -------------------------------------------------------------------
 # Storage & Channel Configuration
 # -------------------------------------------------------------------
-BIN_CHANNEL_RAW = os.getenv("BIN_CHANNEL", "-1004442649308").strip()
+BIN_CHANNEL_RAW = os.getenv("BIN_CHANNEL", "-1004412044372").strip()
 try:
     BIN_CHANNEL = int(BIN_CHANNEL_RAW)
 except ValueError:
@@ -24,7 +24,7 @@ REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "yagamicorpor
 # -------------------------------------------------------------------
 # Server Settings
 # -------------------------------------------------------------------
-BASE_URL = os.getenv("BASE_URL", "https://filetostream-9257652a6256.herokuapp.com").rstrip("/")
+BASE_URL = os.getenv("BASE_URL", "https://filetostream-915a8dcd0cea.herokuapp.com/").rstrip("/")
 PORT = int(os.getenv("PORT", "8080"))
 
 # -------------------------------------------------------------------
@@ -32,7 +32,7 @@ PORT = int(os.getenv("PORT", "8080"))
 # -------------------------------------------------------------------
 MONGO_URI = os.getenv(
     "MONGO_URI",
-    "mongodb+srv://gopaljibillionaire_db_user:lZXfbyvE3u92EdP5@cluster0.cusdpcp.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    "mongodb+srv://gopaljibillionaire_db_user:R2dB1hEM1sjHmUzc@cluster0.y1akz97.mongodb.net/?appName=Cluster0"
 )
 DATABASE_NAME = os.getenv("DATABASE_NAME", "telegram_stream_bot")
 
