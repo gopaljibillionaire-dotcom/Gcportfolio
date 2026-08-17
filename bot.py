@@ -447,7 +447,6 @@ async def handle_incoming_file(client: Client, message: Message):
     proc_msg = await message.reply_text("⚡ Processing and storing file...")
 
     try:
-        # Replaced .forward() with .copy() to bypass forward restriction issues
         log_msg = await message.copy(chat_id=config.BIN_CHANNEL)
     except Exception as e:
         logger.error(f"BIN_CHANNEL Copy Error: {e}")
@@ -556,9 +555,6 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             reply_markup=InlineKeyboardMarkup(back_btn)
         )
 
-    # ---------------------------------------------------------------
-    # Admin Database Clearing Options
-    # ---------------------------------------------------------------
     elif data == "admin_clear_db_menu":
         if user_id not in config.ADMIN_IDS:
             return await callback.answer("Unauthorized", show_alert=True)
@@ -650,12 +646,19 @@ async def start_services():
     bot_info = await app.get_me()
     logger.info(f"Bot active as @{bot_info.username}")
 
-    # Warm up BIN_CHANNEL peer cache
+    # Fetch recent dialogs to cache channel peer IDs and resolve PeerIdInvalid
     try:
-        await app.get_chat(config.BIN_CHANNEL)
-        logger.info(f"Successfully connected to BIN_CHANNEL ({config.BIN_CHANNEL})")
+        logger.info("Caching channel dialogs...")
+        async for _ in app.get_dialogs(limit=100):
+            pass
     except Exception as e:
-        logger.error(f"BIN_CHANNEL Connection Warning: {e}")
+        logger.warning(f"Could not warm up dialog cache: {e}")
+
+    try:
+        chat = await app.get_chat(config.BIN_CHANNEL)
+        logger.info(f"Connected to BIN_CHANNEL: {chat.title} ({chat.id})")
+    except Exception as e:
+        logger.error(f"BIN_CHANNEL Connection Error: {e}")
 
     web_app = web.Application()
     web_app.router.add_get("/", index_handler)
