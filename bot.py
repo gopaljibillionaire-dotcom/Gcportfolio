@@ -5,6 +5,7 @@ import math
 import logging
 import asyncio
 import secrets
+import certifi
 from datetime import datetime, timezone
 
 # -------------------------------------------------------------------
@@ -29,7 +30,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import config
 
 # -------------------------------------------------------------------
-# Custom Button Wrapper (Safely passes style without Pyrogram errors)
+# Custom Button Wrapper
 # -------------------------------------------------------------------
 def InlineKeyboardButton(text: str, callback_data: str = None, url: str = None, style: str = None, **kwargs):
     btn_kwargs = {}
@@ -57,9 +58,9 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 BOT_START_TIME = time.time()
 
 # -------------------------------------------------------------------
-# 3. Database Layer (MongoDB Async Motor)
+# 3. Database Layer (MongoDB Async Motor + Certifi SSL Fix)
 # -------------------------------------------------------------------
-mongo_client = AsyncIOMotorClient(config.MONGO_URI)
+mongo_client = AsyncIOMotorClient(config.MONGO_URI, tlsCAFile=certifi.where())
 db = mongo_client[config.DATABASE_NAME]
 users_col = db["users"]
 files_col = db["files"]
@@ -107,6 +108,19 @@ class Database:
     async def count_files() -> int:
         return await files_col.count_documents({})
 
+    @staticmethod
+    async def clear_files_db():
+        await files_col.delete_many({})
+
+    @staticmethod
+    async def clear_users_db():
+        await users_col.delete_many({})
+
+    @staticmethod
+    async def clear_all_db():
+        await files_col.delete_many({})
+        await users_col.delete_many({})
+
 async def cleanup_database_indexes():
     try:
         await files_col.drop_index("download_token_1")
@@ -129,7 +143,7 @@ app = Client(
 )
 
 # -------------------------------------------------------------------
-# 5. Utilities & Force-Sub Helper
+# 5. Utilities & Helpers
 # -------------------------------------------------------------------
 def get_readable_bytes(size: int) -> str:
     if not size:
@@ -159,7 +173,6 @@ async def check_force_sub(client: Client, user_id: int) -> bool:
     if not config.REQUIRED_CHANNEL_USERNAME:
         return True
     try:
-        # Resolves via public username to prevent "Peer id invalid"
         member = await client.get_chat_member(f"@{config.REQUIRED_CHANNEL_USERNAME}", user_id)
         return member.status in [
             enums.ChatMemberStatus.OWNER,
@@ -287,7 +300,6 @@ async def stream_media_handler(request: web.Request) -> web.StreamResponse:
         response = web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
 
-        # Precise byte-slicing streaming engine
         current_pos = 0
         async for chunk in app.stream_media(message):
             chunk_len = len(chunk)
@@ -398,6 +410,9 @@ async def admin_panel_cmd(client: Client, message: Message):
             InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="success")
         ],
         [
+            InlineKeyboardButton(text="🗑️ Clear Database", callback_data="admin_clear_db_menu", style="danger")
+        ],
+        [
             InlineKeyboardButton(text="Close Panel", callback_data="btn_close", style="danger")
         ]
     ]
@@ -429,16 +444,14 @@ async def handle_incoming_file(client: Client, message: Message):
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
-    proc_msg = await message.reply_text("⚡ Forwarding file to storage server...")
+    proc_msg = await message.reply_text("⚡ Processing and storing file...")
 
     try:
-        log_msg = await message.forward(config.BIN_CHANNEL)
-    except PeerIdInvalid:
-        logger.error(f"BIN_CHANNEL Error: Peer ID {config.BIN_CHANNEL} invalid. Add @Filetostreamrobot as admin to the channel.")
-        return await proc_msg.edit_text("❌ Error: Bot is not added as Administrator in the BIN_CHANNEL.")
+        # Replaced .forward() with .copy() to bypass forward restriction issues
+        log_msg = await message.copy(chat_id=config.BIN_CHANNEL)
     except Exception as e:
-        logger.error(f"BIN_CHANNEL Forward Error: {e}")
-        return await proc_msg.edit_text("❌ Error: Could not forward file to BIN_CHANNEL.")
+        logger.error(f"BIN_CHANNEL Copy Error: {e}")
+        return await proc_msg.edit_text(f"❌ Error: Could not store file ({e})")
 
     media = (
         log_msg.document
@@ -502,6 +515,9 @@ async def callback_handler(client: Client, callback: CallbackQuery):
                 InlineKeyboardButton(text="System Health", callback_data="admin_sys_health", style="success")
             ],
             [
+                InlineKeyboardButton(text="🗑️ Clear Database", callback_data="admin_clear_db_menu", style="danger")
+            ],
+            [
                 InlineKeyboardButton(text="Close Panel", callback_data="btn_close", style="danger")
             ]
         ]
@@ -539,6 +555,45 @@ async def callback_handler(client: Client, callback: CallbackQuery):
             f"🟢 **Database:** Connected",
             reply_markup=InlineKeyboardMarkup(back_btn)
         )
+
+    # ---------------------------------------------------------------
+    # Admin Database Clearing Options
+    # ---------------------------------------------------------------
+    elif data == "admin_clear_db_menu":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+
+        clear_keyboard = [
+            [InlineKeyboardButton(text="📁 Clear Files Only", callback_data="confirm_clear_files", style="danger")],
+            [InlineKeyboardButton(text="👥 Clear Users Only", callback_data="confirm_clear_users", style="danger")],
+            [InlineKeyboardButton(text="🔥 Clear Entire Database", callback_data="confirm_clear_all", style="danger")],
+            [InlineKeyboardButton(text="Back to Admin", callback_data="admin_dashboard", style="primary")]
+        ]
+        await callback.message.edit_text(
+            "⚠️ **Database Wipe Management**\n\nSelect which collection you want to erase:",
+            reply_markup=InlineKeyboardMarkup(clear_keyboard)
+        )
+
+    elif data == "confirm_clear_files":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+        await Database.clear_files_db()
+        await callback.answer("Files collection wiped successfully!", show_alert=True)
+        await callback_handler(client, callback)
+
+    elif data == "confirm_clear_users":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+        await Database.clear_users_db()
+        await callback.answer("Users collection wiped successfully!", show_alert=True)
+        await callback_handler(client, callback)
+
+    elif data == "confirm_clear_all":
+        if user_id not in config.ADMIN_IDS:
+            return await callback.answer("Unauthorized", show_alert=True)
+        await Database.clear_all_db()
+        await callback.answer("Entire database wiped successfully!", show_alert=True)
+        await callback_handler(client, callback)
 
     elif data == "btn_help":
         back_btn = [[InlineKeyboardButton(text="Back", callback_data="btn_home", style="primary")]]
@@ -594,6 +649,13 @@ async def start_services():
     await app.start()
     bot_info = await app.get_me()
     logger.info(f"Bot active as @{bot_info.username}")
+
+    # Warm up BIN_CHANNEL peer cache
+    try:
+        await app.get_chat(config.BIN_CHANNEL)
+        logger.info(f"Successfully connected to BIN_CHANNEL ({config.BIN_CHANNEL})")
+    except Exception as e:
+        logger.error(f"BIN_CHANNEL Connection Warning: {e}")
 
     web_app = web.Application()
     web_app.router.add_get("/", index_handler)
